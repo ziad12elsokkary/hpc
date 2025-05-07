@@ -1,0 +1,258 @@
+#include <opencv2/opencv.hpp>
+#include <vector>
+#include <cmath>
+#include <chrono>
+#include <iostream>
+#include <numeric>
+#include <omp.h>
+#include <memory>
+
+using namespace cv;
+using namespace std;
+using namespace std::chrono;
+
+// ================== Global Variables ==================
+int originalScale = 100;
+int equalizedScale = 100;
+const int maxScalePercentage = 500;
+Mat displayedOriginalHist, displayedEqualizedHist;
+Mat globalOutputImage;
+struct ProcessingBuffers {
+    vector<int> hist;        // Size 256
+    vector<float> prob;      // Size 256
+    vector<float> cumProb;   // Size 256
+    vector<uchar> intensityMap; // Size 256
+
+    ProcessingBuffers() : hist(256, 0), prob(256, 0.0f),
+        cumProb(256, 0.0f), intensityMap(256, 0) {}
+} globalBuffers;
+int globalTotalPixels = 0;
+vector<double> globalTimings;
+
+// ================== Parallel Core Functions ==================
+void calculateHistogram(const Mat& image, ProcessingBuffers& buffers, double& elapsedTime) {
+    auto start = high_resolution_clock::now();
+    fill(buffers.hist.begin(), buffers.hist.end(), 0);
+
+    const int totalPixels = image.rows * image.cols;
+    const uchar* imgData = image.data;
+    omp_set_num_threads(12);
+
+#pragma omp parallel
+    {
+        vector<int> local_hist(256, 0);
+
+#pragma omp for
+        for (int i = 0; i < totalPixels; i++) {
+            local_hist[imgData[i]]++;
+        }
+
+#pragma omp critical
+        {
+            for (int j = 0; j < 256; j++) {
+                buffers.hist[j] += local_hist[j];
+            }
+        }
+    }
+
+    elapsedTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
+}
+
+void applyIntensityMap(Mat& image, ProcessingBuffers& buffers, double& elapsedTime) {
+    auto start = high_resolution_clock::now();
+    const int totalPixels = image.rows * image.cols;
+    uchar* imgData = image.data;
+
+#pragma omp parallel for
+    for (int i = 0; i < totalPixels; i++) {
+        imgData[i] = buffers.intensityMap[imgData[i]];
+    }
+
+    elapsedTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
+}
+
+// ================== Sequential Functions ==================
+void calculateProbabilities(ProcessingBuffers& buffers, int totalPixels, double& elapsedTime) {
+    auto start = high_resolution_clock::now();
+
+    for (int i = 0; i < 256; i++) {
+        buffers.prob[i] = static_cast<float>(buffers.hist[i]) / totalPixels;
+    }
+
+    elapsedTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
+}
+
+void calculateCumulativeProb(ProcessingBuffers& buffers, double& elapsedTime) {
+    auto start = high_resolution_clock::now();
+
+    buffers.cumProb[0] = buffers.prob[0];
+    for (int i = 1; i < 256; i++) {
+        buffers.cumProb[i] = buffers.cumProb[i - 1] + buffers.prob[i];
+    }
+
+    elapsedTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
+}
+
+void createIntensityMap(ProcessingBuffers& buffers, double& elapsedTime) {
+    auto start = high_resolution_clock::now();
+
+    for (int i = 0; i < 256; i++) {
+        buffers.intensityMap[i] = saturate_cast<uchar>(floor(buffers.cumProb[i] * 255));
+    }
+
+    elapsedTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
+}
+
+// ================== Visualization Functions ==================
+Mat drawHistogram(const vector<int>& hist, const string& title, int totalPixels,
+    float scaleFactor = 1.0f, const vector<double>& timings = {}) {
+    const int histSize = hist.size();
+    const int histWidth = 512, histHeight = 400;
+    const int binWidth = cvRound(static_cast<double>(histWidth) / histSize);
+
+    Mat histImg(histHeight, histWidth, CV_8UC3, Scalar(255, 255, 255));
+
+    // Normalization with scaling
+    float maxVal = 0.0f;
+    vector<float> normalized(histSize);
+    for (int i = 0; i < histSize; i++) {
+        normalized[i] = static_cast<float>(hist[i]) / totalPixels;
+        maxVal = max(maxVal, normalized[i]);
+    }
+
+    float displayMax = maxVal * scaleFactor;
+
+    // Draw scaled bars
+    for (int i = 0; i < histSize; i++) {
+        float height = (normalized[i] / displayMax) * histHeight;
+        height = min(height, static_cast<float>(histHeight));
+        rectangle(histImg, Point(i * binWidth, histHeight - height),
+            Point((i + 1) * binWidth, histHeight),
+            Scalar(0, 0, 255), FILLED);
+    }
+
+    // Text overlay
+    putText(histImg, title, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 0, 0), 2);
+    stringstream scaleText;
+    scaleText << "Scale: " << (scaleFactor * 100) << "%";
+    putText(histImg, scaleText.str(), Point(histWidth - 150, 30),
+        FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 0), 1);
+
+    if (!timings.empty()) {
+        stringstream timingText;
+        timingText << "Processing Time: " << timings[4] << "ms";
+        putText(histImg, timingText.str(), Point(10, 60),
+            FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 0), 1);
+    }
+
+    return histImg;
+}
+
+void onOriginalTrackbar(int, void*) {
+    float scaleFactor = originalScale / 100.0f;
+    displayedOriginalHist = drawHistogram(globalBuffers.hist, "Original Histogram",
+        globalTotalPixels, scaleFactor);
+    imshow("Original Histogram", displayedOriginalHist);
+}
+
+void onEqualizedTrackbar(int, void*) {
+    float scaleFactor = equalizedScale / 100.0f;
+    vector<int> eqHist(256, 0);
+    const uchar* outData = globalOutputImage.data;
+    for (int i = 0; i < globalOutputImage.rows * globalOutputImage.cols; i++) {
+        eqHist[outData[i]]++;
+    }
+    displayedEqualizedHist = drawHistogram(eqHist, "Equalized Histogram",
+        globalTotalPixels, scaleFactor, globalTimings);
+    imshow("Equalized Histogram", displayedEqualizedHist);
+}
+
+void visualizeResults(const Mat& input, const Mat& output,
+    const ProcessingBuffers& buffers, int totalPixels,
+    const vector<double>& timings) {
+    // Store values for callback access
+    globalBuffers = buffers;
+    globalTotalPixels = totalPixels;
+    globalTimings = timings;
+    globalOutputImage = output.clone();
+
+    // Create control windows
+    namedWindow("Original Histogram", WINDOW_AUTOSIZE);
+    namedWindow("Equalized Histogram", WINDOW_AUTOSIZE);
+
+    // Add trackbars to both windows
+    createTrackbar("Zoom:", "Original Histogram", &originalScale,
+        maxScalePercentage, onOriginalTrackbar);
+    createTrackbar("Zoom:", "Equalized Histogram", &equalizedScale,
+        maxScalePercentage, onEqualizedTrackbar);
+
+    // Initial display
+    onOriginalTrackbar(0, 0);
+    onEqualizedTrackbar(0, 0);
+
+    // Combine images
+    Mat combined(input.rows, input.cols * 2, CV_8UC3);
+    cvtColor(input, combined(Rect(0, 0, input.cols, input.rows)), COLOR_GRAY2BGR);
+    cvtColor(output, combined(Rect(input.cols, 0, output.cols, output.rows)), COLOR_GRAY2BGR);
+    imshow("Input vs Equalized", combined);
+}
+
+// ================== Main Function ==================
+int main() {
+    // Read input
+    Mat inputImage = imread("input.jpg", IMREAD_GRAYSCALE);
+    if (inputImage.empty()) {
+        cerr << "Error: Could not read image!" << endl;
+        return -1;
+    }
+
+    // Process image
+    Mat outputImage;
+    ProcessingBuffers buffers;
+    vector<double> timings;
+    const int totalPixels = inputImage.rows * inputImage.cols;
+
+    auto totalStart = high_resolution_clock::now();
+
+    // Processing pipeline
+    double stepTime;
+
+    calculateHistogram(inputImage, buffers, stepTime);
+    timings.push_back(stepTime);
+
+    calculateProbabilities(buffers, totalPixels, stepTime);
+    timings.push_back(stepTime);
+
+    calculateCumulativeProb(buffers, stepTime);
+    timings.push_back(stepTime);
+
+    createIntensityMap(buffers, stepTime);
+    timings.push_back(stepTime);
+
+    outputImage = inputImage.clone();
+    applyIntensityMap(outputImage, buffers, stepTime);
+    timings.push_back(stepTime);
+
+    auto totalStop = high_resolution_clock::now();
+    double totalTime = duration_cast<microseconds>(totalStop - totalStart).count() / 1000.0;
+
+    // Output results
+    cout << fixed;
+    cout.precision(3);
+    cout << "\n=== Execution Times ===\n";
+    cout << "1. Histogram:      " << timings[0] << " ms\n";
+    cout << "2. Probabilities:  " << timings[1] << " ms\n";
+    cout << "3. Cumulative:     " << timings[2] << " ms\n";
+    cout << "4. Intensity Map:  " << timings[3] << " ms\n";
+    cout << "5. Transformation: " << timings[4] << " ms\n";
+    cout << "-----------------------\n";
+    cout << "Total Time:        " << totalTime << " ms\n";
+    cout << "Image Size:        " << inputImage.cols << "x" << inputImage.rows << endl;
+
+    // Save and visualize
+    imwrite("equalized.jpg", outputImage);
+    visualizeResults(inputImage, outputImage, buffers, totalPixels, timings);
+
+    waitKey(0);
+    return 0;
+}
