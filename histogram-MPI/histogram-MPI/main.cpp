@@ -123,24 +123,38 @@ int main(int argc, char** argv) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    // Default paths for input and output images
+    string inputPath = "F:\Senior2\Spring\hpc\histogram images\small.jpg";
+    string outputPath = "equalized.jpg";
+    
+    // Process command-line arguments if provided
+    if (rank == 0) {
+        if (argc > 1) {
+            inputPath = argv[1];
+        }
+        if (argc > 2) {
+            outputPath = argv[2];
+        }
+        cout << "Input image path: " << inputPath << endl;
+        cout << "Output image path: " << outputPath << endl;
+    }
 
     Mat inputImage;
     ProcessingBuffers buffers;
     vector<double> timings;
     int totalPixels = 0;
 
-    // Only root process reads the image and distributes it
     if (rank == 0) {
-        inputImage = imread("input.jpg", IMREAD_GRAYSCALE);
+        inputImage = imread(inputPath, IMREAD_GRAYSCALE);
         if (inputImage.empty()) {
-            cerr << "Error: Could not read image!" << endl;
+            cerr << "Error: Could not read image at path: " << inputPath << endl;
             MPI_Abort(MPI_COMM_WORLD, -1);
             return -1;
         }
         totalPixels = inputImage.rows * inputImage.cols;
     }
 
-    // Broadcast image dimensions to all processes
     int dimensions[2] = { 0, 0 };
     if (rank == 0) {
         dimensions[0] = inputImage.rows;
@@ -152,13 +166,11 @@ int main(int argc, char** argv) {
     int cols = dimensions[1];
     totalPixels = rows * cols;
 
-    // Calculate chunk sizes for each process
     int chunk_size = totalPixels / size;
     int remainder = totalPixels % size;
 
     vector<int> recvcounts(size, chunk_size);
     vector<int> displs(size, 0);
-
     for (int i = 0; i < size; i++) {
         if (i < remainder) recvcounts[i]++;
         if (i > 0) displs[i] = displs[i - 1] + recvcounts[i - 1];
@@ -167,7 +179,6 @@ int main(int argc, char** argv) {
     int local_size = recvcounts[rank];
     vector<uchar> local_pixels(local_size);
 
-    // Scatter the image data
     MPI_Scatterv(rank == 0 ? inputImage.data : nullptr,
         recvcounts.data(), displs.data(), MPI_UNSIGNED_CHAR,
         local_pixels.data(), local_size, MPI_UNSIGNED_CHAR,
@@ -177,35 +188,70 @@ int main(int argc, char** argv) {
     double stepTime;
     auto start = high_resolution_clock::now();
 
-    // 1. Histogram (parallel)
+    // 1. Histogram
     vector<int> local_hist(256, 0);
     for (int i = 0; i < local_size; i++) {
         local_hist[local_pixels[i]]++;
     }
 
-    // Reduce histograms from all processes
-    if (rank == 0) {
-        buffers.hist.resize(256);
-    }
-    MPI_Reduce(local_hist.data(), rank == 0 ? buffers.hist.data() : nullptr,
-        256, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    buffers.hist.resize(256);
+    MPI_Reduce(local_hist.data(), buffers.hist.data(), 256, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
         stepTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
         timings.push_back(stepTime);
     }
 
-    // 2. Probability (parallel on root)
+    // 2. Probability (parallel)
+ // 2. Probability (parallel via scatter/gather of histogram)
+    buffers.prob.resize(256);
+    vector<float> local_prob(256, 0.0f);
+
+    int prob_chunk_size = 256 / size;
+    int prob_remainder = 256 % size;
+
+    vector<int> prob_counts(size, prob_chunk_size);
+    vector<int> prob_displs(size, 0);
+    for (int i = 0; i < size; i++) {
+        if (i < prob_remainder) prob_counts[i]++;
+        if (i > 0) prob_displs[i] = prob_displs[i - 1] + prob_counts[i - 1];
+    }
+
+    vector<int> local_hist_chunk(prob_counts[rank]);
+
     if (rank == 0) {
-        start = high_resolution_clock::now();
-        for (int i = 0; i < 256; i++) {
-            buffers.prob[i] = static_cast<float>(buffers.hist[i]) / totalPixels;
-        }
+        // Already computed histogram on root; scatter chunks
+        MPI_Scatterv(buffers.hist.data(), prob_counts.data(), prob_displs.data(),
+            MPI_INT, local_hist_chunk.data(), prob_counts[rank], MPI_INT,
+            0, MPI_COMM_WORLD);
+    }
+    else {
+        // Receive histogram chunk
+        MPI_Scatterv(nullptr, nullptr, nullptr,
+            MPI_INT, local_hist_chunk.data(), prob_counts[rank], MPI_INT,
+            0, MPI_COMM_WORLD);
+    }
+
+    start = high_resolution_clock::now();
+
+    // Each process computes probability for its histogram chunk
+    vector<float> local_prob_chunk(prob_counts[rank]);
+    for (int i = 0; i < prob_counts[rank]; i++) {
+        local_prob_chunk[i] = static_cast<float>(local_hist_chunk[i]) / totalPixels;
+    }
+
+    // Gather all probability chunks back to root
+    MPI_Gatherv(local_prob_chunk.data(), prob_counts[rank], MPI_FLOAT,
+        buffers.prob.data(), prob_counts.data(), prob_displs.data(),
+        MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
         stepTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
         timings.push_back(stepTime);
     }
 
-    // 3. Cumulative Probability (sequential on root)
+
+    // 3. Cumulative (sequential)
     if (rank == 0) {
         start = high_resolution_clock::now();
         buffers.cumProb[0] = buffers.prob[0];
@@ -216,58 +262,87 @@ int main(int argc, char** argv) {
         timings.push_back(stepTime);
     }
 
-    // 4. Intensity Mapping (parallel on root)
+    // Broadcast cumProb
+    buffers.cumProb.resize(256);
+    MPI_Bcast(buffers.cumProb.data(), 256, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // 4. Intensity Map (parallel)
+ // 4. Intensity Mapping (parallel)
+    buffers.intensityMap.resize(256);
+
+    int map_chunk_size = 256 / size;
+    int map_remainder = 256 % size;
+
+    vector<int> map_counts(size, map_chunk_size);
+    vector<int> map_displs(size, 0);
+    for (int i = 0; i < size; i++) {
+        if (i < map_remainder) map_counts[i]++;
+        if (i > 0) map_displs[i] = map_displs[i - 1] + map_counts[i - 1];
+    }
+
+    // Scatter cumProb to all processes
+    vector<float> local_cumProb_chunk(map_counts[rank]);
+    MPI_Scatterv(buffers.cumProb.data(), map_counts.data(), map_displs.data(), MPI_FLOAT,
+        local_cumProb_chunk.data(), map_counts[rank], MPI_FLOAT,
+        0, MPI_COMM_WORLD);
+
+    start = high_resolution_clock::now();
+
+    // Each process computes a chunk of the intensity map
+    vector<uchar> local_intensity_chunk(map_counts[rank]);
+    for (int i = 0; i < map_counts[rank]; i++) {
+        local_intensity_chunk[i] = saturate_cast<uchar>(floor(local_cumProb_chunk[i] * 255));
+    }
+
+    // Gather intensity map chunks to root
+    MPI_Gatherv(local_intensity_chunk.data(), map_counts[rank], MPI_UNSIGNED_CHAR,
+        buffers.intensityMap.data(), map_counts.data(), map_displs.data(),
+        MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
+
     if (rank == 0) {
-        start = high_resolution_clock::now();
-        for (int i = 0; i < 256; i++) {
-            buffers.intensityMap[i] = saturate_cast<uchar>(floor(buffers.cumProb[i] * 255));
-        }
         stepTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
         timings.push_back(stepTime);
     }
 
-    // Broadcast intensity map to all processes
+    // Broadcast full intensity map to all processes
     MPI_Bcast(buffers.intensityMap.data(), 256, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
 
-    // 5. Apply Mapping (parallel)
+
+    // 5. Apply Mapping
     start = high_resolution_clock::now();
     for (int i = 0; i < local_size; i++) {
         local_pixels[i] = buffers.intensityMap[local_pixels[i]];
     }
 
-    // Gather the processed pixels
     vector<uchar> output_pixels;
     if (rank == 0) {
         output_pixels.resize(totalPixels);
     }
 
     MPI_Gatherv(local_pixels.data(), local_size, MPI_UNSIGNED_CHAR,
-        rank == 0 ? output_pixels.data() : nullptr,
-        recvcounts.data(), displs.data(), MPI_UNSIGNED_CHAR,
-        0, MPI_COMM_WORLD);
+        output_pixels.data(), recvcounts.data(), displs.data(),
+        MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
         stepTime = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1000.0;
         timings.push_back(stepTime);
 
         Mat outputImage(rows, cols, CV_8UC1, output_pixels.data());
-        auto totalStop = high_resolution_clock::now();
-        double totalTime = duration_cast<microseconds>(totalStop - totalStart).count() / 1000.0;
+        double totalTime = duration_cast<microseconds>(high_resolution_clock::now() - totalStart).count() / 1000.0;
 
-        cout << fixed;
-        cout.precision(3);
+        cout << fixed << setprecision(3);
         cout << "\n=== Execution Times ===\n";
         cout << "1. Histogram:      " << timings[0] << " ms\n";
         cout << "2. Probabilities:  " << timings[1] << " ms\n";
         cout << "3. Cumulative:     " << timings[2] << " ms\n";
         cout << "4. Intensity Map:  " << timings[3] << " ms\n";
         cout << "5. Transformation: " << timings[4] << " ms\n";
-        cout << "-----------------------\n";
-        cout << "Total Time:        " << totalTime << " ms\n";
+        cout << "-----------------------\n";        cout << "Total Time:        " << timings[0]+timings[1]+timings[2]+timings[3]+timings[4] << " ms\n";
+        cout << "Total solution Time:" << totalTime << " ms\n";
         cout << "Image Size:        " << cols << "x" << rows << endl;
         cout << "MPI Processes:     " << size << endl;
 
-        imwrite("equalized.jpg", outputImage);
+        imwrite(outputPath, outputImage);
         visualizeResults(inputImage, outputImage, buffers, totalPixels, timings);
         waitKey(0);
     }

@@ -6,9 +6,12 @@ F:\Senior2\Spring\hpc\histogram-MPI\histogram-MPI\main.cpp(55,59): warning C4244
           [
               _Tp=int
           ]
+F:\Senior2\Spring\hpc\histogram-MPI\histogram-MPI\main.cpp(128,24): warning C4129: 'S': unrecognized character escape sequence
+F:\Senior2\Spring\hpc\histogram-MPI\histogram-MPI\main.cpp(128,24): warning C4129: 'h': unrecognized character escape sequence
+F:\Senior2\Spring\hpc\histogram-MPI\histogram-MPI\main.cpp(128,24): warning C4129: 'l': unrecognized character escape sequence
   Generating code
-  248 of 435 functions (57.0%) were compiled, the rest were copied from previous compilation.
-    209 functions were new in current compilation
-    55 functions had inline decision re-evaluated but remain unchanged
+  1 of 458 functions ( 0.2%) were compiled, the rest were copied from previous compilation.
+    0 functions were new in current compilation
+    0 functions had inline decision re-evaluated but remain unchanged
   Finished generating code
   histogram-MPI.vcxproj -> F:\Senior2\Spring\hpc\histogram-MPI\x64\Release\histogram-MPI.exe
