@@ -2,7 +2,7 @@
 <Project>
   <ProjectOutputs>
     <ProjectOutput>
-      <FullPath>F:\Senior2\Spring\hpc\histogram-openMP\x64\Release\histogram-openMP.exe</FullPath>
+      <FullPath>F:\Senior2\Spring\hpc\build_openmp\histogram-openMP.exe</FullPath>
     </ProjectOutput>
   </ProjectOutputs>
   <ContentFiles />

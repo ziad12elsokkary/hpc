@@ -119,10 +119,24 @@ void visualizeResults(const Mat& input, const Mat& output,
 }
 
 // ================== Main Function ==================
-int main() {
-    Mat inputImage = imread("input.jpg", IMREAD_GRAYSCALE);
+int main(int argc, char** argv) {
+    // Default paths for input and output images
+    string inputPath = "input.jpg";
+    string outputPath = "equalized.jpg";
+    
+    // Process command-line arguments if provided
+    if (argc > 1) {
+        inputPath = argv[1];
+    }
+    if (argc > 2) {
+        outputPath = argv[2];
+    }
+    cout << "Input image path: " << inputPath << endl;
+    cout << "Output image path: " << outputPath << endl;
+
+    Mat inputImage = imread(inputPath, IMREAD_GRAYSCALE);
     if (inputImage.empty()) {
-        cerr << "Error: Could not read image!" << endl;
+        cerr << "Error: Could not read image at path: " << inputPath << endl;
         return -1;
     }
 
@@ -194,10 +208,11 @@ int main() {
     cout << "4. Intensity Map:  " << timings[3] << " ms\n";
     cout << "5. Transformation: " << timings[4] << " ms\n";
     cout << "-----------------------\n";
-    cout << "Total Time:        " << totalTime << " ms\n";
+    cout << "Total Time:        " << timings[0] + timings[1] + timings[2] + timings[3] + timings[4] << " ms\n";
+    cout << "Total solution Time:" << totalTime << " ms\n";
     cout << "Image Size:        " << inputImage.cols << "x" << inputImage.rows << endl;
 
-    imwrite("equalized.jpg", outputImage);
+    imwrite(outputPath, outputImage);
     visualizeResults(inputImage, outputImage, buffers, totalPixels, timings);
 
     waitKey(0);
